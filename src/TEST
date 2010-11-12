@@ -1,4 +1,0 @@
-METH="$DAVINCI/patches/netbeans/meth/"
-(cd $METH; ant jar)
-$JAVA7X_HOME/bin/javac SIOC.java
-$JAVA7X_HOME/bin/java -Xbootclasspath/p:$METH/build/classes -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic SIOC

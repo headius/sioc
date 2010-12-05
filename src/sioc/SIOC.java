@@ -29,8 +29,11 @@ import java.util.*;
 import java.io.*;
 import java.dyn.*;
 import java.lang.reflect.*;
+import java.util.ArrayList;
+import javax.management.RuntimeErrorException;
 import static java.dyn.MethodType.*;
 import static java.dyn.MethodHandles.*;
+import static sioc.Workarounds.asInstance;  // 6983726
 
 /*
   To Run:
@@ -44,77 +47,99 @@ import static java.dyn.MethodHandles.*;
  */
 
 /**
- * Scheme in One Class
- * This is a small demonstration of JSR 292 APIs.
+ * SIOC = Scheme in One Class,
+ * a small demonstration of JSR 292 APIs.
  * This project will stay within one class file.
  * <p>
- * Day One:  A REPL that can (print "hello").
+ * <ul>
+ * <li>Day One:  A REPL that can (print "hello").</li>
+ * <li>Day Two:  Access to java.util.List and friends.</li>
+ * </ul>
+ * <p>
+ * Class Workaround is a cheat which works around bugs in pre-FCS 292.
  * @see http://cr.openjdk.java.net/~jrose/pres/indy-javadoc-mlvm/
  * @author John Rose
  */
 class SIOC {
+    private static final boolean DEBUG = true;
+
     public static void main(String... args) throws Throwable {
         new SIOC().run(args);
     }
     public void run(String... args) throws Throwable {
+        setDefault("input", toReader(System.in));
+        setDefault("output", toWriter(System.out));
+        setDefault("error-output", toWriter(System.err));
         List<String> av = new ArrayList<>(Arrays.asList(args));
         boolean didRun = false;
         while (!av.isEmpty()) {
             String a = av.remove(0);
             set("arguments", av);
             switch (a) {
-            case "-f": F_load(av.remove(0)); didRun = true; continue;
-            case "-e": F_load_from_string(av.remove(0)); didRun = true; continue;
-            case "-i": set("arguments", av); interactiveREPL(); return;
-            default: break;
+            case "-l":
+                F_load(av.remove(0));
+                didRun = true; continue;
+            case "-l{":
+                while ((a = av.remove(0)).equals("-}") == false)  F_load(a);
+                didRun = true; continue;
+            case "-c":
+                F_load_from_string(av.remove(0));
+                didRun = true; continue;
+            case "-i":
+                set("arguments", av);
+                interactiveREPL(); return;
             }
             if (a.startsWith("-"))  throw toRTE("bad flag: "+a);
             break;
         }
-        if (!(didRun && av.isEmpty())) {
+        if (!didRun) {
             set("arguments", av);
-            interactiveREPL();
+            F_load(System.in);
         }
     }
 
-    public SIOC() {
-        kind = KIND_NONE;
-        name = null;
+    private SIOC(int kind, Object value) {
+        this.kind = kind;
+        this.value = value;
     }
 
     private static final int
-        KIND_NONE = 0, KIND_SYMBOL = 1, KIND_SPECIAL = 2;
-    private final int kind;
-    private final String name;
+        KIND_SYMBOL     =  1,  // value is String
+        KIND_SPECIAL    =  2,  // value is String
+        KIND_INTERPR    = 10,  // value is a map of local bindings
+        KIND_META_MAP   = 11;  // value is a meta-map tuple
 
-    private SIOC(int kind, String name) {
-        this.kind = kind;
-        this.name = name;
+    private final int kind;
+    private final Object value;
+
+    public SIOC() {
+        this(KIND_INTERPR, new HashMap<String,Object>());
     }
 
     public String toString() {
-        if (name != null)  return name;
+        if (value instanceof String)  return (String) value;
         return super.toString();
     }
 
     public int hashCode() {
-        if (name != null)  return name.hashCode();
-        return super.hashCode();
+        if (value instanceof String)  return ((String)value).hashCode();
+        return super.hashCode();  // identity hash code
     }
 
     public boolean equals(Object x) {
-        if (kind != KIND_NONE && x instanceof SIOC) {
+        if (this == x)  return true;
+        if (x instanceof SIOC) {
             SIOC that = (SIOC) x;
-            return this.kind == that.kind && (Object) this.name == that.name;
+            if (this.kind != that.kind)  return false;
+            if (value instanceof String)  return ((String)value).equals(that.value);
         }
-        return this == x;
+        return false;
     }
 
-    private Map<String, Object> values;
-    private Map<String, Object> values() {
-        if (values == null)
-            return values = new HashMap<>();
-        return values;
+    private Map<String,Object> values() {
+        if (kind == KIND_INTERPR)
+            return (Map<String,Object>) value;
+        throw toRTE("not an interpreter");
     }
 
     public void setDefault(String name, Object x) {
@@ -122,27 +147,35 @@ class SIOC {
         values().put(name, x);
     }
     public void set(String name, Object x) {
-        values().put(name, x);
+        setValue(name, x);
     }
+
+    // strictly local get/set:
     private Object getValue(String name) {
-        if (values == null)  return null;
-        return values.get(name);
+        return values().get(name);
+    }
+    private boolean hasValue(String name) {
+        return values().containsKey(name);
+    }
+    private void setValue(String name, Object x) {
+        values().put(name, x);
     }
 
     private static final Object
-        F_HBend_of_file = special("#!end-of-file"),
-        F_HBend_of_list = special("#!end-of-list"),
-        F_HBdefault_object = special("#!default-object"),
-        F_null = special("null")
+        K_HBend_of_file = special("#!end-of-file"),
+        K_HBend_of_list = special("#!end-of-list"),
+        K_HBdefault_object = special("#!default-object"),
+        K_HBunbound = special("#!unbound"),
+        K_HBimports = special("#!imports")
         ;
     private static final Object
         SP_dot = special("."),
-        S_begin = F_string_Gsymbol("begin"),
-        S_quote = F_string_Gsymbol("quote"),
-        S_setB = F_string_Gsymbol("set!"),
-        S_quasiquote = F_string_Gsymbol("quasiquote"),
-        S_unquote = F_string_Gsymbol("unquote"),
-        S_unquote_splicing = F_string_Gsymbol("unquote-splicing");
+        S_begin = SF_string_Gsymbol("begin"),
+        S_quote = SF_string_Gsymbol("quote"),
+        S_setB = SF_string_Gsymbol("set!"),
+        S_quasiquote = SF_string_Gsymbol("quasiquote"),
+        S_unquote = SF_string_Gsymbol("unquote"),
+        S_unquote_splicing = SF_string_Gsymbol("unquote-splicing");
     private static Object special(String s) {
         return new SIOC(KIND_SPECIAL, s);
     }
@@ -151,33 +184,40 @@ class SIOC {
         setDefault("banner", ";; SIOC");
         setDefault("trailer", ";; exit\n");
         setDefault("prompt", "\n> ");
-        setDefault("input", toReader(System.in));
-        setDefault("output", toWriter(System.out));
-        setDefault("error-output", toWriter(System.err));
-        F_display(get("banner"), get("error-output"));
-        for (;;) {
-            F_display(get("prompt"), get("error-output"));
-            Object x;
-            try {
-                x = F_read();
-                if (x == F_HBend_of_file)
-                    break;
-            } catch (Throwable ex) {
-                if (ex instanceof Error)  throw ex;
-                ex.printStackTrace();
-                continue;
+        Object quit0 = getValue("quit");  // must restore
+        Error quitter = new Error("quit"); // must be new
+        try {
+            setValue("quit", throwException(void.class, Error.class).bindTo(quitter));
+            F_display(get("banner"), get("error-output"));
+            for (;;) {
+                F_display(get("prompt"), get("error-output"));
+                Object x;
+                try {
+                    x = F_read();
+                    if (x == K_HBend_of_file)
+                        break;
+                } catch (Throwable ex) {
+                    if (ex instanceof Error)  throw ex;
+                    ex.printStackTrace();
+                    continue;
+                }
+                Object y;
+                try {
+                    y = F_eval(x);
+                } catch (Throwable ex) {
+                    if (ex instanceof Error)  throw ex;
+                    ex.printStackTrace();
+                    y = ex;
+                }
+                F_print(y);
             }
-            Object y;
-            try {
-                y = F_eval(x);
-            } catch (Throwable ex) {
-                if (ex instanceof Error)  throw ex;
-                ex.printStackTrace();
-                y = ex;
-            }
-            F_print(y);
+            F_display(get("trailer"), get("error-output"));
+        } catch (Error ex) {
+            if (ex == quitter)  return;
+            throw ex;
+        } finally {
+            setValue("quit", quit0);
         }
-        F_display(get("trailer"), get("error-output"));
     }
 
     private Object F_read() throws Throwable { return F_read(get("input")); }
@@ -192,25 +232,95 @@ class SIOC {
     private void F_display(Object x, Object port) throws Throwable {
         unparse(x, toWriter(port), false);
     }
-    private String F_display_to_string(Object x) throws Throwable {
+    private static String SF_display_to_string(Object x) {
         StringWriter port = new StringWriter();
-        unparse(x, port, false);
+        try {
+            unparse(x, port, false);
+        } catch (IOException ex) {
+            return "## "+ex;
+        }
         return port.toString();
     }
 
-    private void F_print(Object x) throws Throwable { F_print(x, get("output")); }
-    private void F_print(Object x, Object port) throws Throwable {
+    private void F_print(Object x) throws IOException { F_print(x, get("output")); }
+    private void F_print(Object x, Object port) throws IOException {
         unparse(x, toWriter(port), true);
     }
-    private String F_print_to_string(Object x) throws Throwable {
+    private String F_print_to_string(Object x) {
         StringWriter port = new StringWriter();
-        unparse(x, port, true);
+        try {
+            unparse(x, port, true);
+        } catch (IOException ex) {
+            return "## "+ex;
+        }
         return port.toString();
     }
 
     private void F_newline() throws Throwable { F_newline(get("output")); }
     private void F_newline(Object port) throws Throwable {
-        toWriter(port).write("\n");
+        Writer out = toWriter(port);
+        out.write("\n");
+        out.flush();
+    }
+
+    private List<String> imports(boolean makeIfNone) {
+        List<String> imports = (List<String>) getValue(K_HBimports.toString());
+        if (imports != null || !makeIfNone)  return imports;
+        setValue(K_HBimports.toString(), imports = new ArrayList<>());
+        return imports;
+    }
+    private void F_import(Object name) {
+        String fullName = null, baseName = null;
+        if (name instanceof List) {
+            List<Object> names = (List<Object>) name;
+            if (names.size() >= 1)
+                fullName = stringOrSymbol(names.get(0));
+            if (names.size() >= 2)
+                baseName = stringOrSymbol(names.get(1));
+            if (names.size() >= 3)
+                fullName = null;
+        } else {
+            fullName = stringOrSymbol(name);
+        }
+        if (fullName != null && baseName == null && fullName.endsWith("...")) {
+            baseName = "...";
+            int dot = fullName.length() - 3;
+            fullName = fullName.substring(0, dot);
+            if (fullName.endsWith("."))  fullName = null;  // too many dots
+        }
+        if (fullName != null && baseName == null) {
+            // java.lang.String => String
+            // java.lang.String#concat => concat
+            // String#concat => concat
+            int dot = fullName.lastIndexOf('.');
+            int hash = fullName.indexOf('#', dot+1);
+            if (hash > 0)
+                baseName = fullName.substring(hash+1);
+            else if (dot > 0)
+                baseName = fullName.substring(dot+1);
+        }
+        if (fullName == null || baseName == null)
+            throw toRTE("bad import: "+SF_display_to_string(name));
+        if (DEBUG)  System.err.println("import "+fullName+" as "+baseName);
+        if (baseName.equals("...")) {
+            List<String> imports = imports(true);
+            if (!imports.contains(fullName))
+                imports.add(fullName);
+        } else {
+            // single-name import
+            if (!hasValue(baseName)) {
+                Object x = get(fullName);
+                if (x == K_HBunbound)  throw toRTE("unbound: "+fullName);
+                setValue(baseName, x);
+            }
+        }
+    }
+    private void F_import(Object... names) throws Throwable {
+        //if (names.length == 0) { F_print_imports(); return; }
+        // FIXME: make it work with String... (JSR 292 bug?)
+        for (Object name : names) {
+            F_import(name);
+        }
     }
 
     private void F_load(File file) throws Throwable {
@@ -225,7 +335,7 @@ class SIOC {
         int[] nextc = {NONE};
         for (;;) {
             Object x = parse(port, nextc);
-            if (x == F_HBend_of_file)  break;
+            if (x == K_HBend_of_file)  break;
             F_eval(x);
         }
     }
@@ -246,19 +356,19 @@ class SIOC {
             List<Object> forms = (List<Object>) exp;
             if (forms.isEmpty())  return exp;  // () self-evaluates
             Object head = forms.get(0);
-            if (F_symbolQ(head)) {
+            if (SF_symbolQ(head)) {
                 Object sym = head;
-                head = get(F_symbol_Gstring(sym));
-                if (!F_procedureQ(head)) {
+                head = get(SF_symbol_Gstring(sym));
+                if (!SF_procedureQ(head)) {
                     // special cases
                     if (S_quote.equals(sym) && forms.size() == 2) {
                         return forms.get(1);
                     }
                     if (S_setB.equals(sym) && forms.size() == 3 &&
-                        F_symbolQ(forms.get(1))) {
+                        SF_symbolQ(forms.get(1))) {
                         Object var = forms.get(1);
                         Object val = F_eval(forms.get(2));
-                        set(F_symbol_Gstring(var), val);
+                        set(SF_symbol_Gstring(var), val);
                         return null;
                     }
                     // no regular binding for the head symbol; compile it
@@ -272,27 +382,66 @@ class SIOC {
                 args[i] = F_eval(args[i]);
             }
             return toMethodHandle(head).invokeWithArguments(args);
-        } else if (F_symbolQ(exp)) {
-            Object x = get(F_symbol_Gstring(exp));
-            if (x == null)  throw toRTE("unbound: "+F_print_to_string(exp));
+        } else if (SF_symbolQ(exp)) {
+            Object x = get(SF_symbol_Gstring(exp));
+            if (x == K_HBunbound)  throw toRTE("unbound: "+F_print_to_string(exp));
             return x;
         } else {
             return exp;  // self-evaluating
         }
     }
 
-    public Object get(String name) throws Throwable {
+    /**
+     * Look up a name in this SIOC.
+     * Prefers locally defined names, but also respects imports.
+     * Return null if the name is unbound.
+     */
+    public Object get(String name) {
         Object x;
         x = getValue(name);
         if (x != null) {
             return x;
         }
         if (values().containsKey(name))
-            return F_null;
-        x = lookupVirtual(name);
+            return null;
+        int dot = name.indexOf(".");
+        if (dot == 0) {
+            x = lookupSelector(name);
+            if (x != null)
+                return x;
+        }
+        if (dot > 0) {
+            x = lookupQualified(name);
+            if (x != null)
+                return x;
+        }
+        if (name.indexOf("#") >= 0) {
+            x = lookupMember(name);
+            if (x != null)
+                return x;
+        }
+        String mang = mangle(name);
+        if (mang != null) {
+            x = metaMapConstant(SIOC_MAP, MANGLE_CONSTANT_PREFIX+mang);
+            if (x != null)          // e.g., K_HBdefault
+                return x;
+            x = metaMapFunctions(SIOC_MAP, MANGLE_GLOBAL_FUNCTION_PREFIX+mang);
+            if (x != null) {        // e.g., SF_list
+                x = overload(x);
+                metaMapConstants(SIOC_MAP).put(name, x);
+                return x;
+            }
+            x = metaMapFunctions(SIOC_MAP, MANGLE_ENGINE_FUNCTION_PREFIX+mang);
+            if (x != null) {        // e.g., F_display
+                x = overload(bindAllTo(x, this));
+                setValue(name, x);  // cache bound version
+                return x;
+            }
+        }
+        x = lookupImported(name);
         if (x != null)
             return x;
-        return lookupStatic(name);
+        return K_HBunbound;
     }
 
     private Object F_compile(Object exp) throws Throwable {
@@ -308,7 +457,7 @@ class SIOC {
 
     private static final int EOF = -1, NONE = -2;
 
-    private Object parse(Reader port, int[] nextc) throws IOException {
+    private static Object parse(Reader port, int[] nextc) throws IOException {
         int c = nextc[0];
         Object x;
         nextc[0] = NONE;
@@ -327,12 +476,12 @@ class SIOC {
                         }
                         xs.add(SP_dot);
                     }
-                    if (x == F_HBend_of_list)
+                    if (x == K_HBend_of_list)
                         return xs;
                     xs.add(x);
                 }
-            case ')': return F_HBend_of_list;
-            case EOF: return F_HBend_of_file;
+            case ')': return K_HBend_of_list;
+            case EOF: return K_HBend_of_file;
             case ';':
                 for (;;) {
                     c = port.read();
@@ -342,15 +491,15 @@ class SIOC {
                     }
                 }
             case '"': return parseQuoted(port, '"');
-            case '|': return F_string_Gsymbol(parseQuoted(port, '|'));
-            case '\'': return F_list(S_quote, parse(port, nextc));
-            case '`': return F_list(S_quasiquote, parse(port, nextc));
+            case '|': return SF_string_Gsymbol(parseQuoted(port, '|'));
+            case '\'': return SF_list(S_quote, parse(port, nextc));
+            case '`': return SF_list(S_quasiquote, parse(port, nextc));
             case ',':
                 c = port.read();
                 if (c == '@')
-                    return F_list(S_unquote_splicing, parse(port, nextc));
+                    return SF_list(S_unquote_splicing, parse(port, nextc));
                 nextc[0] = c;
-                return F_list(S_unquote, parse(port, nextc));
+                return SF_list(S_unquote, parse(port, nextc));
             case '#':
                 c = port.read();
                 switch (c) {
@@ -359,7 +508,7 @@ class SIOC {
                     return ((List<Object>)parse(port, nextc)).toArray();
                 case ';':
                     x = parse(port, nextc);
-                    if (x == F_HBend_of_file)  return x;
+                    if (x == K_HBend_of_file)  return x;
                     c = nextc[0]; nextc[0] = NONE;
                     continue restart;
                 case '\\':
@@ -394,7 +543,7 @@ class SIOC {
         }
     }
 
-    private Object parseIdent(Reader port, int[] nextc, StringBuilder cs) throws IOException {
+    private static Object parseIdent(Reader port, int[] nextc, StringBuilder cs) throws IOException {
         boolean sawEsc = false;
         int pushback = NONE;
     scanIdent:
@@ -419,10 +568,10 @@ class SIOC {
             Object x = specialIdent(s);
             if (x != null)  return x;
         }
-        return F_string_Gsymbol(s);
+        return SF_string_Gsymbol(s);
     }
 
-    private char parseCharName(Reader port, int[] nextc, StringBuilder cs) throws IOException {
+    private static char parseCharName(Reader port, int[] nextc, StringBuilder cs) throws IOException {
         int pushback = NONE;
     scanIdent:
         for (;;) {
@@ -440,7 +589,7 @@ class SIOC {
         if (s.length() == 1)  return s.charAt(0);
         if (s.charAt(0) == 'x' || s.charAt(0) == 'X') {
             try {
-                int code = Integer.parseInt(s.substring(1, s.length()), 16);
+                int code = Integer.parseInt(s.substring(1), 16);
                 if (code == (char)code)
                     return (char) code;
             } catch (NumberFormatException ex) {
@@ -464,7 +613,7 @@ class SIOC {
     private static final String NAMED_CHARS =
         "\0nul;\7alarm;\bbackspace;\ttab;\nlinefeed;\nnewline;\13vtab;\14page;\rreturn;\23esc;\40space;\177delete;";
 
-    private void unparse(Object x, Writer port, boolean isPrint) throws IOException {
+    private static void unparse(Object x, Writer port, boolean isPrint) throws IOException {
         boolean didit = false;
         if (x instanceof List) {
             List<?> xs = (List<?>)x;
@@ -483,8 +632,8 @@ class SIOC {
         } else if (isPrint && x instanceof Boolean) {
             port.write((Boolean)x ? "#t" : "#f");
             didit = true;
-        } else if (isPrint && F_symbolQ(x)) {
-            String s = F_symbol_Gstring(x);
+        } else if (isPrint && SF_symbolQ(x)) {
+            String s = SF_symbol_Gstring(x);
             if (specialIdent(s) != null || hasSpecialChar(s))
                 unparseQuoted(s, port, '|');
             else
@@ -494,7 +643,7 @@ class SIOC {
             unparseQuoted((String)x, port, '"');
             didit = true;
         } else if (x instanceof Character) {
-            char c = (char) x;
+            char c = (Character) x;
             if (isPrint) {
                 port.write("#\\");
             }
@@ -579,7 +728,7 @@ class SIOC {
     private static Object specialIdent(String s) {
         switch (s) {
         case ".": return SP_dot;
-        case "": return F_HBend_of_file;
+        case "": return K_HBend_of_file;
         }
         if (s.charAt(0) == '#' && s.length() > 1) {
             switch (s.charAt(1)) {
@@ -609,44 +758,241 @@ class SIOC {
     }
 
     // Metaobject protocol
-    private static final HashMap<String,Object> STATIC_CACHE = new HashMap<>();
-    private static Object lookupStatic(String name) throws Throwable {
-        Object x = STATIC_CACHE.get(name);
-        if (x == null) {
-            x = lookupReflective(name, true);
-            if (x == null)  return null;
-            STATIC_CACHE.put(name, x);
-        }
+
+    // Object[] fields for a 'meta map'.
+    // We don't have an nested class MetaMap because this is SIOC.
+    private static final int // layout of meta-map
+        META_SCOPE     = 0,  // the class itself
+        META_SUPERS    = 1,  // meta-maps of super scopes
+        META_FIELDS    = 2,  // Class.getFields
+        META_METHODS   = 3,  // Class.getMethods
+        META_FUNCTIONS = 4,  // table of {name: mh*}, overloadable
+        META_CONSTANTS = 5,  // table of {name: x}, not inherited
+        META_COUNT     = 6;  // length of map
+
+    private static Object[] metaMapOf(Class<?> scope) {
+        return CV_makeMetaMap.get(scope);
+    }
+    private static Object[] makeMetaMap(Class<?> scope) {
+        boolean publicOnly = getPublicOnly(scope);
+        Object[] map = new Object[META_COUNT];
+        map[META_SCOPE] = scope;
+        map[META_SUPERS] = publicOnly ? initSuperScopes(scope) : new ArrayList<Class<?>>(0);
+        map[META_FIELDS] = publicOnly ? scope.getFields() : scope.getDeclaredFields();
+        map[META_METHODS] = publicOnly ? scope.getMethods() : scope.getDeclaredMethods();
+        map[META_FUNCTIONS] = new HashMap<>();
+        map[META_CONSTANTS] = new HashMap<>();
+        return map;
+    }
+    private static Class<?> metaMapScope(Object[] map) {
+        return (Class<?>) map[META_SCOPE];
+    }
+    private static List<Class<?>> metaMapSupers(Object[] map) {
+        return (List<Class<?>>) map[META_SUPERS];
+    }
+    private static Field[] metaMapFields(Object[] map) {
+        return (Field[]) map[META_FIELDS];
+    }
+    private static Method[] metaMapMethods(Object[] map) {
+        return (Method[]) map[META_METHODS];
+    }
+    private static Object metaMapFunctions(Object[] map, String name) {
+        Map<String, Object> cache = (Map<String,Object>) map[META_FUNCTIONS];
+        Object x = cache.get(name);
+        if (x == null)  cache.put(name, x = computeMetaMapFunctions(map, name));
+        if (x == NO_METHOD_HANDLES_ARRAY)  return null;
         return x;
     }
-    private static final HashMap<String,MethodHandle> VIRTUAL_CACHE = new HashMap<>();
-    private MethodHandle lookupVirtual(String name) throws Throwable {
-        MethodHandle mh = VIRTUAL_CACHE.get(name);
-        if (mh == null) {
-            mh = (MethodHandle) lookupReflective(name, false);
-            if (mh == null)  return null;
-            VIRTUAL_CACHE.put(name, mh);
-        }
-        return bindCarefully(mh, this);
+    private static Map<String, Object> metaMapConstants(Object[] map) {
+         return (Map<String,Object>) map[META_CONSTANTS];
     }
-    private static final Method[] SIOC_METHODS = filterMembers(SIOC.class.getDeclaredMethods());
-    private static final Field[] SIOC_FIELDS = filterMembers(SIOC.class.getDeclaredFields());
+    private static Object metaMapConstant(Object[] map, String name) {
+        Map<String, Object> cache = (Map<String,Object>) map[META_CONSTANTS];
+        Object x = cache.get(name);
+        if (x == null)  cache.put(name, x = computeMetaMapConstant(map, name));
+        return x;
+    }
+    private static final String FIELD_SETTER_PREFIX = "<set>";
+    private static Object computeMetaMapFunctions(Object[] map, String name) {
+        Class<?> selfType = metaMapScope(map);
+        Iterator<Class<?>> supers = null;
+        ArrayList<MethodHandle> mhs = new ArrayList<>();
+        for (;;) {
+            try {
+                String fname = name;
+                boolean isSetter = false;
+                if (fname.startsWith(FIELD_SETTER_PREFIX)) {
+                    fname = fname.substring(FIELD_SETTER_PREFIX.length());
+                    isSetter = true;
+                }
+                for (Field f : metaMapFields(map)) {
+                    if (f.getName().equals(fname)) {
+                        if (isSetter)
+                            maybeAdd(mhs, LOOKUP.unreflectSetter(f));
+                        else
+                            maybeAdd(mhs, LOOKUP.unreflectGetter(f));
+                        break;
+                    }
+                }
+                for (Method m : metaMapMethods(map)) {
+                    if (!m.getName().equals(fname))  continue;
+                    MethodHandle mh = LOOKUP.unreflect(m);
+                    boolean isva = isVarArgs(mh.type(), VARARGS_TYPE);
+                    if (isva != m.isVarArgs())  throw toRTE("bad varargs: "+m);
+                    if (!Modifier.isStatic(m.getModifiers()))
+                        mh = mh.asType(mh.type().changeParameterType(0, selfType));
+                    maybeAdd(mhs, mh);
+                }
+            } catch (ReflectiveOperationException ex) {
+                if (DEBUG)  System.err.println(ex);
+            }
+            if (supers == null)
+                supers = metaMapSupers(map).iterator();
+            if (supers.hasNext())
+                map = metaMapOf(supers.next());
+            else
+                break;
+        }
+        int mhCount = mhs.size();
+        switch (mhCount) {
+        case 0:  return NO_METHOD_HANDLES_ARRAY;
+        case 1:  return mhs.get(0);
+        default: return mhs.toArray(new MethodHandle[mhCount]);
+        }
+    }
+    private static void maybeAdd(List<MethodHandle> mhs, MethodHandle mh) {
+        if (mh == null)  return;
+        MethodType type = mh.type();
+        for (MethodHandle mh0 : mhs) {
+            if (mh0.type().equals(type))  return;
+        }
+        mhs.add(mh);
+    }
+    private static Object computeMetaMapConstant(Object[] map, String name) {
+        for (Field f : metaMapFields(map)) {
+            if (!f.getName().equals(name))  continue;
+            if (!Modifier.isStatic(f.getModifiers()))  continue;
+            if (!Modifier.isFinal(f.getModifiers()))  continue;
+            try {
+                return f.get(null);
+            } catch (final IllegalArgumentException | IllegalAccessException ex) {
+                return ex;
+            }
+        }
+        return null;
+    }
+
+    private static List<Class<?>> initSuperScopes(Class<?> scope) {
+        List<Class<?>> supers = new ArrayList<>();
+        if (scope.isArray()) {
+            Class<?> elt = scope.getComponentType();
+            if (elt == Object.class || elt.isPrimitive()) {
+                supers.add(java.lang.reflect.Array.class);
+                supers.add(java.util.Arrays.class);
+            } else {
+                supers.add(Array.newInstance(elt.getSuperclass(), 0).getClass());
+            }
+        } else if (!scope.isInterface()) {
+            Class<?> supc = scope.getSuperclass();
+            if (supc != null)  supers.add(supc);
+        }
+        Collections.addAll(supers, scope.getInterfaces());
+        if (scope.isPrimitive()) {
+            supers.add(toWrapperType(scope));
+        }
+        return supers;
+    }
+    private static boolean getPublicOnly(Class<?> scope) {
+        return scope != SIOC.class;  // generalize?
+    }
+
+    private static Class<?> lookupQualified(String name) { // java.lang.String
+        if (name.indexOf('.') <= 0)  return null;
+        try {
+            return Class.forName(name);
+        } catch (ClassNotFoundException ex) {
+            return null;
+        }
+    }
+    private static MethodHandle lookupSelector(String name) { // .length
+        if (!name.startsWith("."))  return null;
+        name = name.substring(1);
+        MethodHandle vamh = MH_applySelector.bindTo(name);
+        return arityOverload(null, vamh);
+    }
+    // FIXME: Should have a separate receiver argument, not buried in varargs.
+    private static Object applySelector(String name, //Object receiver,
+                                        Object... args) throws Throwable {
+        Object receiver = args[0];
+        Object mhs = metaMapFunctions(metaMapOf(receiver.getClass()), name);
+        MethodHandle mh = findFirstApplicable(mhs, args.length, args);
+        return mh.invokeWithArguments(args);
+    }
+    private static MethodHandle findFirstApplicable(Object mhs, int argc, Object... argv) {
+        if (mhs instanceof MethodHandle)
+            return (MethodHandle) mhs;
+        MethodHandle[] mha = (MethodHandle[]) mhs;
+        for (MethodHandle mh : mha) {
+            if (isApplicable(mh, argc, argv))
+                return mh;
+        }
+        return mha[0];
+    }
+    private static boolean isApplicable(MethodHandle mh, int argc, Object... argv) {
+        if (true)  throw new UnsupportedOperationException("NYI");
+        return false;
+    }
+
+    private static Object lookupMember(String name) { // String#length
+        int hash = name.indexOf('#');
+        if (hash < 0)  return null;
+        Class<?> scope = lookupQualified(name.substring(0, hash));
+        if (scope == null)  return null;
+        name = name.substring(hash+1);
+        Object[] map = metaMapOf(scope);
+        Object x = metaMapConstant(map, name);
+        if (x != null)  return x;
+        return overload(metaMapFunctions(map, name));
+    }
+    private static MethodHandle lookupImported(String name) { // .length
+        if (DEBUG) System.err.println("lookupImported "+name);
+        return null; // @@ NYI
+    }
+
+    private static final MethodHandle[] NO_METHOD_HANDLES_ARRAY = {};
+    private static final List<MethodHandle> NO_METHOD_HANDLES = Arrays.asList(NO_METHOD_HANDLES_ARRAY);
+
+    private static List<MethodHandle> expandMHList(Object mhs) {
+        if (mhs == null)
+            return NO_METHOD_HANDLES;
+        else if (mhs instanceof MethodHandle)
+            return Arrays.asList((MethodHandle) mhs);
+        else if (mhs instanceof MethodHandle[])
+            return Arrays.asList((MethodHandle[]) mhs);
+        else
+            return (List<MethodHandle>) mhs;
+    }
+    private static Object collapseMHList(List<MethodHandle> mhs) {
+        if (mhs == null || mhs.isEmpty())
+            return null;
+        else if (mhs.size() == 1)
+            return mhs.get(0);
+        else
+            return mhs;
+    }
+
     private static final Class<?> VARARGS_TYPE = Object[].class;  // local marker for VA methods
-    private static <T extends Member> T[] filterMembers(T[] mems0) {
-        ArrayList<T> mems = new ArrayList<>(Arrays.asList(mems0));
-        for (Iterator<T> i = mems.iterator(); i.hasNext(); ) {
-            if (!i.next().getName().startsWith("F_"))
-                i.remove();
-        }
-        return mems.toArray(Arrays.copyOf(mems0, mems.size()));
-    }
 
     private static final Lookup LOOKUP = MethodHandles.lookup();
     private static final MethodHandle MH_chooseMethod;
     private static final MethodHandle MH_vaTypeHandler;
     private static final MethodHandle MH_bindTypeHandler;
+    private static final MethodHandle MH_applySelector;
+    private static final MethodHandle MH_flattenVarargs;
     private static final Comparator<Class<?>> C_compareClasses;
     private static final Comparator<MethodHandle> C_compareMethodHandles;
+    private static final ClassValue<Object[]> CV_makeMetaMap;
+    private static final Object[] SIOC_MAP;
     static {
         try {
             MH_chooseMethod = LOOKUP
@@ -664,8 +1010,19 @@ class SIOC {
                             methodType(MethodHandle.class,
                                        MethodHandle.class, MethodType.class,
                                        MethodHandle.class, Object.class));
+            MH_applySelector = LOOKUP
+                .findStatic(SIOC.class, "applySelector",
+                            methodType(Object.class,
+                                       String.class,
+                                       Object[].class));
+            MH_flattenVarargs = LOOKUP
+                .findStatic(SIOC.class, "flattenVarargs",
+                            methodType(Object.class,
+                                       Class.class,
+                                       Object[].class));
             MethodType C_type = methodType(int.class,
                                            Object.class, Object.class);
+            MethodType CV_type = methodType(Object.class, Class.class);
             MethodHandle MH_compareClasses = LOOKUP
                 .findStatic(SIOC.class, "compareClasses",
                             methodType(int.class,
@@ -678,56 +1035,25 @@ class SIOC {
                                        MethodHandle.class, MethodHandle.class));
             C_compareMethodHandles = asInstance(MH_compareMethodHandles.asType(C_type),
                                                 Comparator.class);
+            MethodHandle MH_makeMetaMap = LOOKUP
+                .findStatic(SIOC.class, "makeMetaMap",
+                            methodType(Object[].class, Class.class));
+            ClassValue cv = asInstance(MH_makeMetaMap.asType(CV_type),
+                                       ClassValue.class);
+            CV_makeMetaMap = (ClassValue<Object[]>) cv;
+            SIOC_MAP = metaMapOf(SIOC.class);
         } catch (ReflectiveOperationException ex) {
-            Error err = new InternalError("bad lookup");
-            err.initCause(ex);
-            throw err;
+            throw toIE("bad lookup", ex);
         }
-    }
-
-    private static Object lookupReflective(String name, boolean isStatic) throws Throwable {
-        String mang = mangle(name);  // e.g., F_list
-        if (mang == null)  return null;
-        Object x = null;
-        for (Field f : SIOC_FIELDS) {
-            if (!matchMember(f, mang, isStatic))  continue;
-            x = f.get(null);
-            break;
-        }
-        MethodHandle mh = null;
-        List<MethodHandle> mhs = null;
-        if (x != null) {
-            if (x instanceof MethodHandle)
-                mh = (MethodHandle) x;  // go for more overloads
-            else if (isStatic)
-                return x;
-        }
-        for (Method m : SIOC_METHODS) {
-            if (!matchMember(m, mang, isStatic))  continue;
-            MethodHandle mh1 = LOOKUP.unreflect(m);
-            boolean isva = isVarArgs(mh1.type(), VARARGS_TYPE);
-            if (isva != m.isVarArgs())  throw toRTE("bad varargs: "+m);
-            if (mh == null) { mh = mh1; continue; }
-            if (mhs == null) { mhs = new ArrayList<>(); mhs.add(mh); }
-            mhs.add(mh1);
-        }
-        if (mhs == null) {
-            return mh;  // null or unique
-        }
-        assert(mhs.contains(mh));
-        return overload(mhs, VARARGS_TYPE);
-    }
-    private static boolean matchMember(Member m, String name, boolean isStatic) {
-        return (m.getName().equals(name)
-                && isStatic == Modifier.isStatic(m.getModifiers()));
     }
 
     // mh.bindTo(x) but preserving type handler (variadic properties)
-    public static MethodHandle bindCarefully(MethodHandle mh, Object x) {
+    // question:  what relation does this have to JSR 292?
+    private static MethodHandle bindCarefully(MethodHandle mh, Object x) {
+        // ?? mh = mh.asType(mh.type().changeParameterType(0, x.getClass()))
         MethodHandle leadmh = mh.bindTo(x);
         MethodHandle typeHandler = insertArguments(MH_bindTypeHandler, 2, mh, x);
         return leadmh.withTypeHandler(typeHandler);
-
     }
     private static MethodHandle bindTypeHandler(MethodHandle leadmh, MethodType type,
                                                 MethodHandle mh, Object x) {
@@ -736,8 +1062,17 @@ class SIOC {
         return mh.asType(type.insertParameterTypes(0, xtype)).bindTo(x);
     }
 
-    public static MethodHandle overload(List<MethodHandle> mhs, Class<?> varargsType) throws Throwable {
+    /**
+     * Take the given series of method handles and combine them into one
+     * method handle which will dispatch on its arity and argument types
+     * to call the first applicable member the given series.
+     * @param mhs set of method handles to combine into one
+     * @param varargsType the type (if any) to treat as a rest-argument
+     * @return a combined method handle
+     */
+    public static MethodHandle overload(List<MethodHandle> mhs, Class<?> varargsType) {
         if (mhs == null || mhs.isEmpty())  return null;
+
         // Pass 1: Determine arities and detect varargs.
         int minac = (char)-1, maxac = -1, varac = -1;
         for (MethodHandle mh : mhs) {
@@ -825,6 +1160,42 @@ class SIOC {
         // Merge all the groups together.
         return arityOverload(mhsToOverload, vamh);
     }
+    private static MethodHandle overload(Object mhs) {
+        return overload(mhs, VARARGS_TYPE);
+    }
+    private static MethodHandle overload(Object mhs, Class<?> varargsType) {
+        if (mhs instanceof MethodHandle) {
+            MethodHandle mh = (MethodHandle) mhs;
+            if (!isVarArgs(mh.type(), varargsType))
+                return mh;
+        }
+        return overload(expandMHList(mhs), varargsType);
+    }
+    private static Object bindAllTo(Object mhs, Object arg0) {
+        if (mhs instanceof MethodHandle)
+            return bindTo((MethodHandle) mhs, arg0);
+        List<MethodHandle> bmhs = new ArrayList<>();
+        for (MethodHandle mh : expandMHList(mhs)) {
+            maybeAdd(bmhs, bindTo(mh, arg0));
+        }
+        return bmhs;
+    }
+    private static MethodHandle bindTo(MethodHandle mh, Object arg0) {
+        if (mh == null)  return null;
+        MethodType type = mh.type();
+        int arity = type.parameterCount();
+        if (arity == 0)  return null;
+        Class<?> t0 = type.parameterType(0);
+        if (arity == 1 && t0 == VARARGS_TYPE) {
+            // insert an extra parameter so we can bind it
+            mh = adjustArity(mh, 1, true);
+            type = mh.type();
+            t0 = type.parameterType(0);
+        }
+        if (!canConvertArgumentTo(t0, arg0))  return null;
+        return mh.bindTo(arg0);
+    }
+
     private static <T> void addIfNotNull(List<T> ls, T x) {
         if (x != null)  ls.add(x);
     }
@@ -835,10 +1206,13 @@ class SIOC {
     }
 
     public static MethodHandle adjustArity(MethodHandle mh, int ac) {
+        return adjustArity(mh, ac, false);
+    }
+    public static MethodHandle adjustArity(MethodHandle mh, int ac, boolean keepVarargs) {
         MethodType type = mh.type();
         int fixedArgs = type.parameterCount() - 1;
         int collectArgs = ac - fixedArgs;
-        assert(fixedArgs > 0 && collectArgs >= 0);
+        if (fixedArgs < 0 || collectArgs < 0)  return null;
         Class<?> vap = type.parameterType(fixedArgs);  // varargs param
         Class<?> ptype = vap.getComponentType();
         if (ptype == null) {
@@ -847,14 +1221,34 @@ class SIOC {
             type = type.changeParameterType(fixedArgs, vap);
             mh = explicitCastArguments(mh, type);
         }
-        // convert (A..., P[]) to (A..., P...)
-        return mh.asCollector(vap, collectArgs);
+        if (keepVarargs) {
+            if (collectArgs == 0)  return mh;
+            // convert (A..., P[]) to (A..., P..., P[])
+            MethodHandle flatten = MH_flattenVarargs.bindTo(vap);
+            flatten = flatten.asType(methodType(vap, Object[].class));
+            MethodHandle vamh = filterArguments(mh, fixedArgs, flatten);
+            return vamh.asCollector(Object[].class, collectArgs+1);
+        } else {
+            // convert (A..., P[]) to (A..., P...)
+            return mh.asCollector(vap, collectArgs);
+        }
     }
-    public static MethodHandle adjustArity(MethodHandle mh, MethodType type) {
-        return adjustArity(mh, type.parameterCount()).asType(type);
+    private static Object flattenVarargs(Class<?> vatype, Object[] argv) {
+        System.out.println("flattenVarargs "+Arrays.deepToString(argv));
+        Class<? extends Object[]> vaptype = vatype.asSubclass(Object[].class);
+        int firstCount = argv.length - 1;
+        Object[] last = (Object[]) argv[firstCount];
+        if (last == null)
+            return Arrays.copyOfRange(argv, 0, firstCount, vaptype);
+        int lastCount = last.length;
+        Object[] allargv = Arrays.copyOfRange(argv, 0, firstCount + lastCount, vaptype);
+        System.arraycopy(last, 0, allargv, firstCount, lastCount);
+        System.out.println("flattenVarargs => "+Arrays.deepToString(allargv));
+        return allargv;
     }
 
     public static MethodHandle arityOverload(List<MethodHandle> mhs, MethodHandle vamh) {
+        if (mhs == null)  mhs = Collections.emptyList();
         if (vamh == null && mhs.size() <= 1)
             return (mhs.isEmpty() ? null : mhs.get(0));
         //System.err.println("arityOverload"+mhs+", va="+vamh);
@@ -1110,10 +1504,14 @@ class SIOC {
         return compareClasses(t0.returnType(), t1.returnType());
     }
 
+    private static final String
+        MANGLE_ENGINE_FUNCTION_PREFIX = "F_",
+        MANGLE_GLOBAL_FUNCTION_PREFIX = "SF_",
+        MANGLE_CONSTANT_PREFIX = "K_";
     private static final String MANGLE_CHARS = "A@B!C:D/E=G>H#L<M&P+Q?T*V^";
     //  also: "_-X0Ua": X hex, U upper
     private static String mangle(String s) {
-        StringBuilder mang = new StringBuilder("F_");
+        StringBuilder mang = new StringBuilder(8 + s.length());
         for (int len = s.length(), i = 0; i < len; i++) {
             char c = s.charAt(i);
             if (c == '-') {
@@ -1130,7 +1528,7 @@ class SIOC {
                 mang.append(MANGLE_CHARS.charAt(cindex-1));
                 continue;
             }
-            if (Character.isJavaLetterOrDigit(c)) {
+            if (Character.isJavaIdentifierPart(c)) {
                 mang.append(c);
                 continue;
             }
@@ -1143,45 +1541,55 @@ class SIOC {
             }
             mang.append(xstr);
         }
+        if (mang.length() == s.length() && mang.indexOf(s) == 0)
+            return s;  // no change
         return mang.toString();
     }
 
     // Functions
-    private static Object F_list(Object x, Object y) {
+    private static Object SF_list(Object x, Object y) {
         return Arrays.asList(x, y);
     }
-    private static Object F_list(Object... xs) {
+    private static Object SF_list(Object... xs) {
         return Arrays.asList(xs);
     }
-    private static String F_symbol_Gstring(Object x) {
+    private static String SF_symbol_Gstring(Object x) {
         return ((SIOC)x).toString();
     }
-    private static Object F_string_Gsymbol(String x) {
+    private static Object SF_string_Gsymbol(String x) {
         return new SIOC(KIND_SYMBOL, x.intern());
     }
-    private static boolean F_symbolQ(Object x) {
+    private static boolean SF_symbolQ(Object x) {
         return x instanceof SIOC && ((SIOC)x).kind == KIND_SYMBOL;
     }
-    private static boolean F_procedureQ(Object x) {
+    private static boolean SF_stringQ(Object x) {
+        return x instanceof CharSequence;  // ??
+    }
+    private static boolean SF_procedureQ(Object x) {
         return x instanceof MethodHandle;
+    }
+    private static String stringOrSymbol(Object x) {
+        if (SF_symbolQ(x) || SF_stringQ(x))
+            return x.toString();
+        throw toRTE("not a symbol or string: "+SF_display_to_string(x));
     }
 
     // arithmetic
-    private static int F_P(int x, int y) { return x + y; }
-    private static int F__(int x, int y) { return x - y; }
-    private static int F__(       int y) { return   - y; }
-    private static int F_T(int x, int y) { return x * y; }
-    private static int F_D(int x, int y) { return x / y; }
-    private static long F_P(long x, long y) { return x + y; }
-    private static long F__(long x, long y) { return x - y; }
-    private static long F__(        long y) { return   - y; }
-    private static long F_T(long x, long y) { return x * y; }
-    private static long F_D(long x, long y) { return x / y; }
-    private static double F_P(double x, double y) { return x + y; }
-    private static double F__(double x, double y) { return x - y; }
-    private static double F__(          double y) { return   - y; }
-    private static double F_T(double x, double y) { return x * y; }
-    private static double F_D(double x, double y) { return x / y; }
+    private static int SF_P(int x, int y) { return x + y; }
+    private static int SF__(int x, int y) { return x - y; }
+    private static int SF__(       int y) { return   - y; }
+    private static int SF_T(int x, int y) { return x * y; }
+    private static int SF_D(int x, int y) { return x / y; }
+    private static long SF_P(long x, long y) { return x + y; }
+    private static long SF__(long x, long y) { return x - y; }
+    private static long SF__(        long y) { return   - y; }
+    private static long SF_T(long x, long y) { return x * y; }
+    private static long SF_D(long x, long y) { return x / y; }
+    private static double SF_P(double x, double y) { return x + y; }
+    private static double SF__(double x, double y) { return x - y; }
+    private static double SF__(          double y) { return   - y; }
+    private static double SF_T(double x, double y) { return x * y; }
+    private static double SF_D(double x, double y) { return x / y; }
 
     // conversions
     private MethodHandle toMethodHandle(Object x) {
@@ -1199,13 +1607,12 @@ class SIOC {
             return new PrintWriter((OutputStream)x, true);
         return (Writer) x;
     }
-    private String toDisplayString(Object x) throws Throwable {
-        return F_display_to_string(x);
-    }
-    private String toPrintString(Object x) throws Throwable {
-        return F_print_to_string(x);
-    }
     private static RuntimeException toRTE(String x) {
         return new RuntimeException(x);
+    }
+    private static InternalError toIE(String x, Throwable ex) {
+        InternalError err = new InternalError(x);
+        err.initCause(ex);
+        return err;
     }
 }

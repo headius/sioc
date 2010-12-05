@@ -1,7 +1,29 @@
 METH="$DAVINCI/patches/netbeans/meth/"
 # (cd $METH; ant jar)
 CLASSES=../../build/classes
+DIST=../../build/dist
 mkdir -p $CLASSES
+$JAVA7X_HOME/bin/javac -d $CLASSES Workarounds.java
 $JAVA7X_HOME/bin/javac -cp $CLASSES -d $CLASSES SIOC.java
+
 [ $? = 0 ] &&
-$JAVA7X_HOME/bin/java -Xbootclasspath/p:$METH/build/classes -cp $CLASSES -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic sioc.SIOC
+$JAVA7X_HOME/bin/java -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic -jar $DIST/sioc.jar -c '(print (list "Hello," "world"))'
+
+[ $? = 0 ] &&
+$JAVA7X_HOME/bin/java -Xbootclasspath/p:$METH/build/classes -cp $CLASSES -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic sioc.SIOC -i
+
+: Sample Interactive Run: '
+--------
+	$JAVA7X_HOME/bin/java -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles -jar dist/sioc.jar -i
+OpenJDK Server VM warning: JSR 292 invokedynamic is disabled in this JVM.  Use -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic to enable.
+;; SIOC
+> (print (list 1 2.3 'four "five!"))
+lookupImported quote
+(1 2.3 four "five!")null
+> (java.lang.String#length "asdf")
+4
+> java.io.File#separatorChar
+#\/
+> (quit)
+--------
+'

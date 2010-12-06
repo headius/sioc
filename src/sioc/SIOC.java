@@ -158,6 +158,10 @@ class SIOC {
         return values().containsKey(name);
     }
     private void setValue(String name, Object x) {
+        if (x == K_HBunbound) {
+            values().remove(name);
+            return;
+        }
         values().put(name, x);
     }
 
@@ -303,6 +307,11 @@ class SIOC {
             throw toRTE("bad import: "+SF_display_to_string(name));
         if (DEBUG)  System.err.println("import "+fullName+" as "+baseName);
         if (baseName.equals("...")) {
+            if (!fullName.endsWith(".") && !fullName.endsWith("#"))
+                fullName = fullName + ".";
+            String scopeName = fullName.substring(0, fullName.length()-1);
+            if (lookupScope(scopeName) == null)
+                throw toRTE("unbound scope name: "+scopeName);
             List<String> imports = imports(true);
             if (!imports.contains(fullName))
                 imports.add(fullName);
@@ -322,7 +331,23 @@ class SIOC {
             F_import(name);
         }
     }
-
+    private Object lookupImported(String name, boolean scopesOnly) { // String
+        List<String> imports = imports(false);
+        if (imports == null)  return null;
+        Object x1 = null;
+        for (String i : imports) {
+            String name2 = i + name;
+            Object x2;
+            if (i.endsWith("."))       x2 = lookupQualified(name2);
+            else if (i.endsWith("#"))  x2 = scopesOnly ? null : lookupMember(name2);
+            else  throw toRTE("bad import: "+i);
+            if (x2 == null)  continue;
+            if (x1 == null) { x1 = x2; continue; }
+            if (x1 != x2)  throw toRTE("ambiguous import of "+name+": "+x1+" & "+x2);
+        }
+        return x1;
+    }
+    
     private void F_load(File file) throws Throwable {
         BufferedReader port = new BufferedReader(new FileReader(file));
         try {
@@ -410,11 +435,6 @@ class SIOC {
             if (x != null)
                 return x;
         }
-        if (dot > 0) {
-            x = lookupQualified(name);
-            if (x != null)
-                return x;
-        }
         if (name.indexOf("#") >= 0) {
             x = lookupMember(name);
             if (x != null)
@@ -438,9 +458,18 @@ class SIOC {
                 return x;
             }
         }
-        x = lookupImported(name);
-        if (x != null)
+        if (dot > 0) {
+            x = lookupQualified(name);
+            if (x != null) {
+                setValue(name, x);
+                return x;
+            }
+        }
+        x = lookupImported(name, false);
+        if (x != null) {
+            setValue(name, x);
             return x;
+        }
         return K_HBunbound;
     }
 
@@ -906,14 +935,6 @@ class SIOC {
         return scope != SIOC.class;  // generalize?
     }
 
-    private static Class<?> lookupQualified(String name) { // java.lang.String
-        if (name.indexOf('.') <= 0)  return null;
-        try {
-            return Class.forName(name);
-        } catch (ClassNotFoundException ex) {
-            return null;
-        }
-    }
     private static MethodHandle lookupSelector(String name) { // .length
         if (!name.startsWith("."))  return null;
         name = name.substring(1);
@@ -923,8 +944,11 @@ class SIOC {
     // FIXME: Should have a separate receiver argument, not buried in varargs.
     private static Object applySelector(String name, //Object receiver,
                                         Object... args) throws Throwable {
+        //if (DEBUG) System.err.println("applySelector "+name+" to "+Arrays.asList(args));
         Object receiver = args[0];
-        Object mhs = metaMapFunctions(metaMapOf(receiver.getClass()), name);
+        Class<? extends Object> rclass = receiver.getClass();
+        Object mhs = metaMapFunctions(metaMapOf(rclass), name);
+        if (mhs == null)  throw toRTE("selector unbound: "+rclass.getName()+"#"+name);
         MethodHandle mh = findFirstApplicable(mhs, args.length, args);
         return mh.invokeWithArguments(args);
     }
@@ -939,24 +963,52 @@ class SIOC {
         return mha[0];
     }
     private static boolean isApplicable(MethodHandle mh, int argc, Object... argv) {
-        if (true)  throw new UnsupportedOperationException("NYI");
-        return false;
+        MethodType type = mh.type();
+        int pc = type.parameterCount();
+        boolean isva = isVarArgs(type, VARARGS_TYPE);
+        if (isva)  pc -= 1;
+        if (!isva ? argc != pc : argc < pc)  return false;
+        if (argv != null) {
+            int i = 0;
+            for (Class<?> pt : type.parameterList()) {
+                if (i == argv.length)  break;
+                Object arg = argv[i++];
+                if (!canConvertArgumentTo(pt, arg))  return false;
+            }
+        }
+        return true;
     }
-
-    private static Object lookupMember(String name) { // String#length
+    
+    private Object lookupMember(String name) { // String#length
         int hash = name.indexOf('#');
         if (hash < 0)  return null;
-        Class<?> scope = lookupQualified(name.substring(0, hash));
-        if (scope == null)  return null;
+        Object scope = lookupScope(name.substring(0, hash));
+        if (!(scope instanceof Class))  return null;
         name = name.substring(hash+1);
-        Object[] map = metaMapOf(scope);
+        Object[] map = metaMapOf((Class<?>) scope);
         Object x = metaMapConstant(map, name);
         if (x != null)  return x;
         return overload(metaMapFunctions(map, name));
     }
-    private static MethodHandle lookupImported(String name) { // .length
-        if (DEBUG) System.err.println("lookupImported "+name);
-        return null; // @@ NYI
+
+    private static Object lookupQualified(String name) { // java.lang.String
+        try {
+            return Class.forName(name);
+        } catch (ClassNotFoundException ex) {
+        }
+        return Package.getPackage(name);
+    }
+    private static boolean isScope(Object x) {
+        return x instanceof Class || x instanceof Package;
+    }
+    private Object lookupScope(String name) { // String
+        Object x = values().get(name);
+        if (isScope(x))  return x;
+        x = lookupQualified(name);
+        if (isScope(x))  return x;
+        x = lookupImported(name, true);
+        if (isScope(x))  return x;
+        return null;
     }
 
     private static final MethodHandle[] NO_METHOD_HANDLES_ARRAY = {};

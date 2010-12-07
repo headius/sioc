@@ -25,12 +25,15 @@
 
 package sioc;
 
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.net.MalformedURLException;
 import java.util.*;
 import java.io.*;
 import java.dyn.*;
 import java.lang.reflect.*;
+import java.net.URL;
 import java.util.ArrayList;
-import javax.management.RuntimeErrorException;
 import static java.dyn.MethodType.*;
 import static java.dyn.MethodHandles.*;
 import static sioc.Workarounds.asInstance;  // 6983726
@@ -71,10 +74,15 @@ class SIOC {
         setDefault("output", toWriter(System.out));
         setDefault("error-output", toWriter(System.err));
         List<String> av = new ArrayList<>(Arrays.asList(args));
-        boolean didRun = false;
+        boolean didRun = false, needInit = true;
         while (!av.isEmpty()) {
             String a = av.remove(0);
             set("arguments", av);
+            switch (a) {
+            case "--no-init":  needInit = false; continue;
+            }
+            // following options all need initialization
+            if (needInit) { doInit(); needInit = false; }
             switch (a) {
             case "-l":
                 F_load(av.remove(0));
@@ -93,6 +101,7 @@ class SIOC {
             break;
         }
         if (!didRun) {
+            if (needInit) { doInit(); needInit = false; }
             set("arguments", av);
             F_load(System.in);
         }
@@ -101,6 +110,10 @@ class SIOC {
     private SIOC(int kind, Object value) {
         this.kind = kind;
         this.value = value;
+    }
+    
+    private void doInit() throws Throwable {
+        F_load("sioc:SIOC.base.scm");
     }
 
     private static final int
@@ -170,16 +183,17 @@ class SIOC {
         K_HBend_of_list = special("#!end-of-list"),
         K_HBdefault_object = special("#!default-object"),
         K_HBunbound = special("#!unbound"),
-        K_HBimports = special("#!imports")
-        ;
-    private static final Object
-        SP_dot = special("."),
+        K_HBimports = special("#!imports"),
+        DOT_TOKEN = special("."),
+        EMPTY_LIST = Collections.unmodifiableList(Arrays.asList()),
         S_begin = SF_string_Gsymbol("begin"),
         S_quote = SF_string_Gsymbol("quote"),
         S_setB = SF_string_Gsymbol("set!"),
+        S_define = SF_string_Gsymbol("define"),
         S_quasiquote = SF_string_Gsymbol("quasiquote"),
         S_unquote = SF_string_Gsymbol("unquote"),
-        S_unquote_splicing = SF_string_Gsymbol("unquote-splicing");
+        S_unquote_splicing = SF_string_Gsymbol("unquote-splicing"),
+        K_null = null;         // eval(null) => #!null
     private static Object special(String s) {
         return new SIOC(KIND_SPECIAL, s);
     }
@@ -250,7 +264,7 @@ class SIOC {
     private void F_print(Object x, Object port) throws IOException {
         unparse(x, toWriter(port), true);
     }
-    private String F_print_to_string(Object x) {
+    private static String SF_print_to_string(Object x) {
         StringWriter port = new StringWriter();
         try {
             unparse(x, port, true);
@@ -349,34 +363,71 @@ class SIOC {
     }
     
     private void F_load(File file) throws Throwable {
-        BufferedReader port = new BufferedReader(new FileReader(file));
+        F_load(new FileReader(file));
+    }
+    private void F_load(URL url) throws Throwable {
+        F_load(url.openStream());
+    }
+    private void F_load(InputStream port) throws Throwable {
+        F_load(new InputStreamReader(port));
+    }
+    private void F_load(Reader port) throws Throwable {
+        int[] nextc = {NONE};
+        if (!(port instanceof BufferedReader))
+            port = new BufferedReader(port);
         try {
-            F_load(port);
+            for (;;) {
+                Object x = parse(port, nextc);
+                if (x == K_HBend_of_file)  break;
+                F_eval(x);
+            }
         } finally {
             port.close();
         }
     }
-    private void F_load(Reader port) throws Throwable {
-        int[] nextc = {NONE};
-        for (;;) {
-            Object x = parse(port, nextc);
-            if (x == K_HBend_of_file)  break;
-            F_eval(x);
-        }
-    }
     private void F_load(Object source) throws Throwable {
         if (source instanceof String)
-            F_load(new File((String)source));
-        else if (source instanceof File)
-             F_load((File)source);
+            source = toFileOrURL((String) source);
+        if (source instanceof File)
+            F_load((File)source);
+        else if (source instanceof URL)
+            F_load((URL)source);
         else
             F_load(toReader(source));
     }
     private void F_load_from_string(String exp) throws Throwable {
         F_load(new StringReader(exp));
     }
+    private Object toFileOrURL(String x) {
+        if (x.startsWith("file:")) {
+            return new File(x.substring(5));
+        }
+        if (x.startsWith("sioc:")) {
+            String rn = x.substring(5);
+            InputStream port = SIOC.class.getResourceAsStream(rn);
+            if (port == null)  throw toRTE("no such resource: "+rn);
+            return port;
+        }
+        int col = x.indexOf(':');
+        if (col > 0 && Character.isLetter(x.charAt(0))) {
+            for (int i = 1; i < col; i++) {
+                char xc = x.charAt(i);
+                if (!Character.isLetterOrDigit(xc) && -1 == "-+.".indexOf(xc))
+                    return new File(x);
+            }
+            try {
+                return new URL(x);
+            } catch (MalformedURLException ex) {
+            }
+        }
+        return new File(x);
+    }
 
     private Object F_eval(Object exp) throws Throwable {
+        if (DEBUG)  System.err.println("eval "+SF_print_to_string(exp));
+        return eval(exp);
+    }
+    private Object eval(Object exp) throws Throwable {
         if (exp instanceof List) {
             List<Object> forms = (List<Object>) exp;
             if (forms.isEmpty())  return exp;  // () self-evaluates
@@ -389,27 +440,27 @@ class SIOC {
                     if (S_quote.equals(sym) && forms.size() == 2) {
                         return forms.get(1);
                     }
-                    if (S_setB.equals(sym) && forms.size() == 3 &&
-                        SF_symbolQ(forms.get(1))) {
+                    if ((S_setB.equals(sym) || S_define.equals(sym))
+                            && forms.size() == 3 && SF_symbolQ(forms.get(1))) {
                         Object var = forms.get(1);
-                        Object val = F_eval(forms.get(2));
+                        Object val = eval(forms.get(2));
                         set(SF_symbol_Gstring(var), val);
                         return null;
                     }
                     // no regular binding for the head symbol; compile it
-                    return F_eval(F_compile(exp));
+                    return eval(F_compile(exp));
                 }
             } else {
-                head = F_eval(head);
+                head = eval(head);
             }
             Object[] args = forms.subList(1, forms.size()).toArray();
             for (int i = 0; i < args.length; i++) {
-                args[i] = F_eval(args[i]);
+                args[i] = eval(args[i]);
             }
             return toMethodHandle(head).invokeWithArguments(args);
         } else if (SF_symbolQ(exp)) {
             Object x = get(SF_symbol_Gstring(exp));
-            if (x == K_HBunbound)  throw toRTE("unbound: "+F_print_to_string(exp));
+            if (x == K_HBunbound)  throw toRTE("unbound: "+SF_print_to_string(exp));
             return x;
         } else {
             return exp;  // self-evaluating
@@ -474,7 +525,7 @@ class SIOC {
     }
 
     private Object F_compile(Object exp) throws Throwable {
-        throw toRTE("cannot compile: "+limit(F_print_to_string(exp)));
+        throw toRTE("cannot compile: "+limit(SF_print_to_string(exp)));
     }
     private String limit(String x) {
         if (x.length() > 100)
@@ -495,18 +546,22 @@ class SIOC {
             switch (c) {
             case NONE: c = port.read(); continue restart;
             case '(':
-                for (ArrayList<Object> xs = new ArrayList<>();;) {
+                for (List<Object> xs = new ArrayList<>();;) {
                     x = parse(port, nextc);
-                    if (x == SP_dot) {
+                    if (x == DOT_TOKEN) {
                         x = parse(port, nextc);
                         if (x instanceof List) {
                             xs.addAll((List<Object>)x);
                             continue;
                         }
-                        xs.add(SP_dot);
+                        xs.add(DOT_TOKEN);
                     }
-                    if (x == K_HBend_of_list)
+                    if (x == K_HBend_of_list) {
+                        if (xs.isEmpty())  return EMPTY_LIST;
+                        xs = Arrays.asList(xs.toArray());
+                        xs = Collections.unmodifiableList(xs);
                         return xs;
+                    }
                     xs.add(x);
                 }
             case ')': return K_HBend_of_list;
@@ -644,7 +699,10 @@ class SIOC {
 
     private static void unparse(Object x, Writer port, boolean isPrint) throws IOException {
         boolean didit = false;
-        if (x instanceof List) {
+        if (x == null) {
+            port.write("#!null");
+            didit = true;
+        } else if (x instanceof List) {
             List<?> xs = (List<?>)x;
             port.write('(');
             boolean first = true;
@@ -756,7 +814,7 @@ class SIOC {
     private static final String NUM_CHARS = "-.0123456789";
     private static Object specialIdent(String s) {
         switch (s) {
-        case ".": return SP_dot;
+        case ".": return DOT_TOKEN;
         case "": return K_HBend_of_file;
         }
         if (s.charAt(0) == '#' && s.length() > 1) {
@@ -795,9 +853,10 @@ class SIOC {
         META_SUPERS    = 1,  // meta-maps of super scopes
         META_FIELDS    = 2,  // Class.getFields
         META_METHODS   = 3,  // Class.getMethods
-        META_FUNCTIONS = 4,  // table of {name: mh*}, overloadable
-        META_CONSTANTS = 5,  // table of {name: x}, not inherited
-        META_COUNT     = 6;  // length of map
+        META_CTORS     = 4,  // Class.getConstructors
+        META_FUNCTIONS = 5,  // table of {name: mh*}, overloadable
+        META_CONSTANTS = 6,  // table of {name: x}, not inherited
+        META_COUNT     = 7;  // length of map
 
     private static Object[] metaMapOf(Class<?> scope) {
         return CV_makeMetaMap.get(scope);
@@ -809,6 +868,7 @@ class SIOC {
         map[META_SUPERS] = publicOnly ? initSuperScopes(scope) : new ArrayList<Class<?>>(0);
         map[META_FIELDS] = publicOnly ? scope.getFields() : scope.getDeclaredFields();
         map[META_METHODS] = publicOnly ? scope.getMethods() : scope.getDeclaredMethods();
+        map[META_CTORS] = publicOnly ? scope.getConstructors() : scope.getDeclaredConstructors();
         map[META_FUNCTIONS] = new HashMap<>();
         map[META_CONSTANTS] = new HashMap<>();
         return map;
@@ -824,6 +884,9 @@ class SIOC {
     }
     private static Method[] metaMapMethods(Object[] map) {
         return (Method[]) map[META_METHODS];
+    }
+    private static Constructor[] metaMapConstructors(Object[] map) {
+        return (Constructor[]) map[META_CTORS];
     }
     private static Object metaMapFunctions(Object[] map, String name) {
         Map<String, Object> cache = (Map<String,Object>) map[META_FUNCTIONS];
@@ -841,37 +904,87 @@ class SIOC {
         if (x == null)  cache.put(name, x = computeMetaMapConstant(map, name));
         return x;
     }
-    private static final String FIELD_SETTER_PREFIX = "<set>";
+    private static final String
+        FIELD_GETTER_PREFIX = "get:",
+        FIELD_SETTER_PREFIX = "set:",
+        METHOD_CALLER_PREFIX = "call:",
+        NEW_INSTANCE_NAME = "new";
+    private static final Pattern ARITY_PATTERN = Pattern.compile(":[0-9]+$");
     private static Object computeMetaMapFunctions(Object[] map, String name) {
+        // parse the name
+        int minArity = 0, maxArity = (char)-1;
+        int col = name.indexOf(':');
+        if (col >= 0) {
+            Matcher match = ARITY_PATTERN.matcher(name);
+            if (match.find()) {
+                int apos = match.start();
+                String arity = name.substring(apos+1);
+                minArity = maxArity = Integer.parseInt(arity);
+                name = name.substring(0, apos);
+                col = name.indexOf(':');
+            }
+        }
+        String fieldName = name, methodName = name;
+        boolean isSetter = false, isConstructor = false;
+        if (col >= 0) {
+            String baseName = name.substring(col+1);
+            if (name.startsWith(FIELD_GETTER_PREFIX)) {
+                fieldName = baseName;
+                methodName = null;
+            } else if (name.startsWith(FIELD_SETTER_PREFIX)) {
+                fieldName = baseName;
+                methodName = null;
+                isSetter = true;
+            } else if (name.startsWith(METHOD_CALLER_PREFIX)) {
+                fieldName = null;
+                methodName = baseName;
+            }
+        } else if (name.equals(NEW_INSTANCE_NAME)) {
+            fieldName = methodName = null;
+            isConstructor = true;
+        }
         Class<?> selfType = metaMapScope(map);
         Iterator<Class<?>> supers = null;
         ArrayList<MethodHandle> mhs = new ArrayList<>();
         for (;;) {
             try {
-                String fname = name;
-                boolean isSetter = false;
-                if (fname.startsWith(FIELD_SETTER_PREFIX)) {
-                    fname = fname.substring(FIELD_SETTER_PREFIX.length());
-                    isSetter = true;
-                }
-                for (Field f : metaMapFields(map)) {
-                    if (f.getName().equals(fname)) {
-                        if (isSetter)
-                            maybeAdd(mhs, LOOKUP.unreflectSetter(f));
-                        else
-                            maybeAdd(mhs, LOOKUP.unreflectGetter(f));
-                        break;
+                if (fieldName != null) {
+                    for (Field f : metaMapFields(map)) {
+                        if (f.getName().equals(fieldName)) {
+                            if (isSetter)
+                                maybeAdd(mhs, LOOKUP.unreflectSetter(f));
+                            else
+                                maybeAdd(mhs, LOOKUP.unreflectGetter(f));
+                            break;
+                        }
                     }
                 }
-                for (Method m : metaMapMethods(map)) {
-                    if (!m.getName().equals(fname))  continue;
-                    MethodHandle mh = LOOKUP.unreflect(m);
-                    boolean isva = isVarArgs(mh.type(), VARARGS_TYPE);
-                    if (isva != m.isVarArgs())  throw toRTE("bad varargs: "+m);
-                    if (!Modifier.isStatic(m.getModifiers()))
-                        mh = mh.asType(mh.type().changeParameterType(0, selfType));
-                    maybeAdd(mhs, mh);
+                Member badva = null;
+                if (isConstructor) {
+                    for (Constructor c : metaMapConstructors(map)) {
+                        MethodHandle mh = LOOKUP.unreflectConstructor(c);
+                        boolean isva = isVarArgs(mh.type(), VARARGS_TYPE);
+                        if (isva != c.isVarArgs()) { badva = c; continue; }
+                        maybeAdd(mhs, mh);
+                    }
                 }
+                if (methodName != null) {
+                    for (Method m : metaMapMethods(map)) {
+                        if (!m.getName().equals(methodName))  continue;
+                        MethodHandle mh = LOOKUP.unreflect(m);
+                        MethodType type = mh.type();
+                        int arity = type.parameterCount();
+                        if (arity < minArity || arity > maxArity)  continue;
+                        System.err.println("found "+mh);//@@
+                        boolean isva = isVarArgs(type, VARARGS_TYPE);
+                        if (isva != m.isVarArgs()) { badva = m; continue; }
+                        if (!Modifier.isStatic(m.getModifiers()))
+                            mh = mh.asType(mh.type().changeParameterType(0, selfType));
+                        maybeAdd(mhs, mh);
+                    }
+                }
+                if (badva != null && mhs.isEmpty())
+                    throw toRTE("bad varargs: "+badva);
             } catch (ReflectiveOperationException ex) {
                 if (DEBUG)  System.err.println(ex);
             }
@@ -1559,8 +1672,9 @@ class SIOC {
     private static final String
         MANGLE_ENGINE_FUNCTION_PREFIX = "F_",
         MANGLE_GLOBAL_FUNCTION_PREFIX = "SF_",
+        //MANGLE_SYMBOL_PREFIX = "S_",  // not used reflectively
         MANGLE_CONSTANT_PREFIX = "K_";
-    private static final String MANGLE_CHARS = "A@B!C:D/E=G>H#L<M&P+Q?T*V^";
+    private static final String MANGLE_CHARS = "A@B!C:D/E=G>H#L<M&P+Q?S*T%V^";
     //  also: "_-X0Ua": X hex, U upper
     private static String mangle(String s) {
         StringBuilder mang = new StringBuilder(8 + s.length());
@@ -1605,6 +1719,10 @@ class SIOC {
     private static Object SF_list(Object... xs) {
         return Arrays.asList(xs);
     }
+    private static Object SF_list_tail(Object x, int n) {
+        List ls = (List) x;
+        return ls.subList(n, ls.size());
+    }
     private static String SF_symbol_Gstring(Object x) {
         return ((SIOC)x).toString();
     }
@@ -1630,18 +1748,36 @@ class SIOC {
     private static int SF_P(int x, int y) { return x + y; }
     private static int SF__(int x, int y) { return x - y; }
     private static int SF__(       int y) { return   - y; }
-    private static int SF_T(int x, int y) { return x * y; }
+    private static int SF_S(int x, int y) { return x * y; }
     private static int SF_D(int x, int y) { return x / y; }
     private static long SF_P(long x, long y) { return x + y; }
     private static long SF__(long x, long y) { return x - y; }
     private static long SF__(        long y) { return   - y; }
-    private static long SF_T(long x, long y) { return x * y; }
+    private static long SF_S(long x, long y) { return x * y; }
     private static long SF_D(long x, long y) { return x / y; }
     private static double SF_P(double x, double y) { return x + y; }
     private static double SF__(double x, double y) { return x - y; }
     private static double SF__(          double y) { return   - y; }
-    private static double SF_T(double x, double y) { return x * y; }
+    private static double SF_S(double x, double y) { return x * y; }
     private static double SF_D(double x, double y) { return x / y; }
+    
+    private static MethodHandle SF_Tbind_left(MethodHandle f, Object x) {
+        return bindCarefully(f, x);
+    }
+    private static MethodHandle SF_Tbind_right(MethodHandle f, Object x) {
+        return insertArguments(f, f.type().parameterCount()-1, x);
+    }
+    private static MethodHandle SF_Tcompose(MethodHandle f, MethodHandle g) {
+        if (g.type().parameterCount() == 1)
+            return filterArguments(f, 0, g);
+        return filterReturnValue(g, f);
+    }
+    private static MethodHandle SF_Tcompose(MethodHandle f, int pos, MethodHandle g) {
+        return filterArguments(f, pos, g);
+    }
+    private static MethodType SF_Tmethod_type(Class rtype, Object... ptypes) {
+        return methodType(rtype, Arrays.copyOf(ptypes, ptypes.length, Class[].class));
+    }
 
     // conversions
     private MethodHandle toMethodHandle(Object x) {

@@ -43,11 +43,19 @@ import static sioc.Workarounds.asInstance;  // 6983726
   $ METHCP="$DAVINCI/patches/netbeans/meth/build/classes"
   $ (cd "$DAVINCI/patches/netbeans/meth"; ant jar)
   $ $JAVA7X_HOME/bin/javac SIOC.java
-  $ $JAVA7X_HOME/bin/java -Xbootclasspath/p:$METHCP -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic SIOC
+  $ $JAVA7X_HOME/bin/java -Xbootclasspath/p:$METHCP -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic SIOC -i
   (print "hello")
   (set! n (+ 2 2))
   (list n (+ 2.1 2.3))
- */
+  $ $JAVA7X_HOME/bin/java -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic -jar dist/sioc.jar -i
+  (import 'java.io...)
+  (define f (File#new "manifest.mf"))
+  (print (File#exists f)) ;=> #t
+  (define p (FileReader#new f))
+  (set! p (BufferedReader#new p))
+  (print (BufferedReader#readLine p)) ;=> "Manifest-Version: 1.0"
+  (quit)
+  */
 
 /**
  * SIOC = Scheme in One Class,
@@ -227,7 +235,8 @@ class SIOC {
                     ex.printStackTrace();
                     y = ex;
                 }
-                F_print(y);
+                if (y != null)  // null stands for a void value
+                    F_print(y);
             }
             F_display(get("trailer"), get("error-output"));
         } catch (Error ex) {
@@ -424,7 +433,7 @@ class SIOC {
     }
 
     private Object F_eval(Object exp) throws Throwable {
-        if (DEBUG)  System.err.println("eval "+SF_print_to_string(exp));
+        //if (DEBUG)  System.err.println("eval "+SF_print_to_string(exp));
         return eval(exp);
     }
     private Object eval(Object exp) throws Throwable {
@@ -975,7 +984,6 @@ class SIOC {
                         MethodType type = mh.type();
                         int arity = type.parameterCount();
                         if (arity < minArity || arity > maxArity)  continue;
-                        System.err.println("found "+mh);//@@
                         boolean isva = isVarArgs(type, VARARGS_TYPE);
                         if (isva != m.isVarArgs()) { badva = m; continue; }
                         if (!Modifier.isStatic(m.getModifiers()))

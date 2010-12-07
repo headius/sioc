@@ -1,5 +1,3 @@
-(display "LOADING BASE.SCM\n")
-
 #;
 (import
   'java.util.List
